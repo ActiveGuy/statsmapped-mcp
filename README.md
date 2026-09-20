@@ -98,7 +98,6 @@ that speaks Streamable HTTP directly.
 ## Development
 
 ```bash
-cd mcp-server
 pip install -e .
 python tests/test_client.py
 ```
@@ -106,6 +105,15 @@ python tests/test_client.py
 The test suite runs against the real live API (`https://statsmapped.com` by default, or
 `STATSMAPPED_MCP_BASE_URL` if set) — read-only GETs only, nothing here writes any data or needs
 a key.
+
+## Releasing
+
+Publishing to PyPI happens automatically via `.github/workflows/publish.yml` on creating a
+GitHub Release — no API token is stored anywhere. It uses
+[PyPI's Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC): PyPI is told,
+once, to trust this exact repo + workflow file + GitHub environment (`pypi`) combination, via
+PyPI's own "Publishing" settings page under this project. To release: bump `version` in
+`pyproject.toml`, commit, then draft a GitHub Release with a matching tag (e.g. `v0.2.0`).
 
 ## Licence
 

@@ -1,0 +1,43 @@
+name: Publish to PyPI
+
+# Triggers on creating a GitHub Release (developer's choice, 2026-09-20) -- draft a
+# release with a version tag and a line or two of notes, and this builds and publishes
+# automatically. Uses PyPI's Trusted Publishing (OIDC): no API token is stored as a
+# secret anywhere -- PyPI trusts this exact repo + workflow file + environment
+# combination directly, configured once on PyPI's own "Publishing" settings page.
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Matches the "Environment name" field on PyPI's trusted-publisher form -- set that
+    # field to "pypi" too (or change both to match) when registering the publisher.
+    environment: pypi
+    permissions:
+      id-token: write  # required for OIDC trusted publishing; no other permission needed
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
