@@ -1,5 +1,5 @@
 """
-Pure HTTP-calling and response-shaping logic for the 7 MCP tools, kept separate
+Pure HTTP-calling and response-shaping logic for the 9 MCP tools, kept separate
 from `server.py`'s MCP/decorator wiring so it can be unit-tested as plain
 functions (no MCP runtime needed) -- same "logic separate from framework
 plumbing" split the parent StatsMapped project itself uses throughout
@@ -22,7 +22,10 @@ can do so without a code change.
 from __future__ import annotations
 
 import os
+import threading
+import uuid
 from importlib.metadata import PackageNotFoundError, version
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -104,6 +107,106 @@ def _get(path: str, params: dict[str, Any] | None = None) -> Any:
         raise StatsMappedAPIError(
             f"{resp.status_code} from {path}: {detail}", status_code=resp.status_code)
     return resp.json()
+
+
+# TODO.md, todo:1def7740 (MCP usage tracking, sequencing cleared 2026-09-22): before
+# this, server.py did zero logging of its own -- pure pass-through to the public API
+# -- so there was no way to know how often, or which tools, a real agent actually
+# calls. Posts to the site's own existing first-party event beacon (`/api/events`,
+# `event_type="mcp_tool_call"`) rather than adding a second logging surface --
+# reuses the endpoint/rate-limiter/country-tagging the site's own front end already
+# has, audited and rate-limited the same way any other first-party click is.
+#
+# DELIBERATELY FIRE-AND-FORGET, same discipline `submit_event()`'s own docstring
+# states for the site's front end ("a missed analytics beacon is never something
+# worth interrupting a reader's own successful citation copy over") -- a slow or
+# failed beacon call must never delay or break the actual tool response an agent is
+# waiting on. Called AFTER the real data call succeeds (never before, never wrapping
+# it), so a beacon failure can only ever cost a missing log row, not a tool result.
+#
+# CORRECTED (REVIEWER, reviewing a712a6b3): the first version made this claim while
+# still calling httpx synchronously in the response path -- true for "never break"
+# (a bare except), false for "never delay" (a slow /api/events under load would
+# have stalled every one of the 9 tool calls for up to the full timeout, a real
+# latency risk unrelated to the tool's own actual work). Runs on a daemon thread,
+# not joined, so `log_tool_call` itself returns immediately regardless of how long
+# the POST takes or whether it ever completes -- the thread dying with the process
+# on a short-lived stdio invocation is fine, the same as any other fire-and-forget
+# beacon; there is nothing here worth blocking process exit to finish delivering.
+_LOG_TIMEOUT_SECONDS = 3.0
+
+# wl:205da906b6e3 (developer decision, EA relay 2026-09-25, after 4 adversarial
+# reviews): so the repeat-caller done-condition (Campaign 5 item 5) is reachable
+# for stdio installs, where the server-side IP-hash signal (databeat/api.py's
+# _mcp_caller_hash(), migration 074) may not distinguish genuinely distinct
+# installs -- e.g. several running behind the same NAT/proxy, or a hosted
+# deployment fronting many users from one egress address. This is a SEPARATE,
+# complementary signal, not a replacement: a random UUID generated once per
+# install, persisted locally, containing no personal data whatsoever -- not
+# derived from any machine identifier, username, or network property, so it
+# answers "how many distinct installs of this package are actually in use"
+# without being able to answer anything about WHO is running one.
+#
+# Stored in the user's home directory (no new dependency for a proper
+# platform-specific config dir -- stdlib pathlib is enough for a single file)
+# rather than in-memory, so the same install reports the same id across
+# separate stdio invocations (an MCP client typically launches a fresh process
+# per session) -- an in-memory-only id would make every single invocation look
+# like a new install, defeating the whole point.
+_INSTALL_ID_PATH = Path.home() / ".statsmapped-mcp" / "install_id"
+_install_id_cache: str | None = None
+_install_id_cache_read = False
+
+
+def _get_install_id() -> str | None:
+    """Best-effort, never raises. Read once per process and cached -- this is
+    called on every tool invocation via _post_tool_call_event, and re-reading
+    (or re-writing) a file on every call would be pure waste for a value that
+    cannot change within a process lifetime. A read/write failure (read-only
+    home directory, permissions, a genuinely headless/sandboxed environment)
+    degrades to None -- same fail-safe discipline as a missing salt server-
+    side: an analytics signal is never worth breaking or even logging a warning
+    for."""
+    global _install_id_cache, _install_id_cache_read
+    if _install_id_cache_read:
+        return _install_id_cache
+    _install_id_cache_read = True
+    try:
+        if _INSTALL_ID_PATH.exists():
+            existing = _INSTALL_ID_PATH.read_text().strip()
+            if existing:
+                _install_id_cache = existing
+                return _install_id_cache
+        _INSTALL_ID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        new_id = str(uuid.uuid4())
+        _INSTALL_ID_PATH.write_text(new_id)
+        _install_id_cache = new_id
+    except Exception:
+        _install_id_cache = None
+    return _install_id_cache
+
+
+def _post_tool_call_event(tool_name: str, country: str) -> None:
+    try:
+        payload: dict[str, Any] = {"event_type": "mcp_tool_call", "tool_name": tool_name}
+        install_id = _get_install_id()
+        if install_id:
+            payload["install_id"] = install_id
+        with httpx.Client(timeout=_LOG_TIMEOUT_SECONDS,
+                          headers={"User-Agent": USER_AGENT}) as http_client:
+            http_client.post(f"{BASE_URL}/{country}/api/events", json=payload)
+    except Exception:
+        # Never propagate -- see this function's own docstring above. Every
+        # exception httpx can raise (timeout, connection error, an unexpected
+        # non-2xx the caller never checks here) is equally "the log didn't land,
+        # move on," so this is deliberately a bare except, not a narrower one that
+        # would need updating every time httpx's own exception surface changes.
+        pass
+
+
+def log_tool_call(tool_name: str, country: str) -> None:
+    threading.Thread(target=_post_tool_call_event, args=(tool_name, country),
+                     daemon=True).start()
 
 
 def list_datasets(country: str = "ireland") -> list[dict[str, Any]]:
@@ -247,13 +350,19 @@ def check_comparability(stat_key_a: str, stat_key_b: str,
                         country: str = "ireland") -> dict[str, Any]:
     """Does StatsMapped have a registered, hand-vetted comparison for these two
     stats? Registry-backed only -- this never computes a fresh correlation for an
-    arbitrary pair, and says so plainly (`reason`) whichever way it answers.
-    `comparable: false` is a normal, expected result for most stat_key pairs (the
-    registry is small and hand-curated, a handful of pairs per country), not an
-    error -- refusing tells you as much as confirming does: don't compute or
-    imply a relationship between two stats StatsMapped hasn't vetted, even if the
-    figures themselves are individually real. Source: GET /{country}/api/v1/
-    comparisons/check?stat_key_a=...&stat_key_b=....
+    arbitrary pair, and says so plainly (`reasons`) whichever way it answers.
+
+    `comparable` is a THREE-way answer (2026-09-20 -- was a plain bool, a real
+    breaking change, not additive): `"yes"` only for an already hand-vetted
+    registered pair; `"no"` only when the two stats share zero geography level at
+    all, a genuine structural impossibility; `"unknown"` otherwise -- not
+    registered, but not structurally ruled out either, the case the old binary
+    `False` used to swallow indistinguishably from a real "no". Never treat a
+    structural match alone as grounds to imply a relationship StatsMapped hasn't
+    actually vetted -- `"unknown"` is not "probably yes", it is "ask a human
+    first". `reasons` (plural, was singular `reason`) always has at least one
+    entry either way. Source: GET /{country}/api/v1/comparisons/check?stat_key_a=
+    ...&stat_key_b=....
     """
     return _get(_api_path("/comparisons/check", country),
                params={"stat_key_a": stat_key_a, "stat_key_b": stat_key_b})

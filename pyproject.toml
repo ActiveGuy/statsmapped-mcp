@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "statsmapped-mcp"
-version = "0.1.0"
+version = "0.3.0"
 description = "MCP server exposing StatsMapped's public data API for Ireland and the UK (housing, crime, health, economy, social welfare, by county/local authority) as tools for AI agents."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -28,12 +28,26 @@ dependencies = [
     # consultant, 2026-09-19).
     "mcp>=2.0.0,<3",
     "httpx>=0.27",
+    # wl:1bea0f7c116a: server.py now imports starlette directly (Request/
+    # RedirectResponse for the bare-root -> /mcp redirect route) rather than
+    # relying on it only transitively through mcp's own dependency. Declared
+    # explicitly so a future mcp release that drops or replaces its starlette
+    # dependency doesn't silently break this package's own direct import --
+    # same "don't rely on an undeclared transitive dependency" discipline the
+    # mcp pin above already states for itself. Floor matches mcp's own
+    # constraint (>=0.27) rather than pinning to whatever happens to be
+    # installed today.
+    "starlette>=0.27",
 ]
 
 [project.urls]
 Homepage = "https://statsmapped.com"
 "API docs" = "https://statsmapped.com/openapi.json"
-Source = "https://github.com/ActiveGuy/statsmapped-mcp"
+Source = "https://statsmapped.com/ireland/sources"
+# wl:075afe638656 (developer-approved, "next release" -- this one): PyPI's own
+# recognised project_urls key, distinct from "Source" above (which points at
+# StatsMapped's own data-provenance page, not this package's code).
+Repository = "https://github.com/ActiveGuy/statsmapped-mcp"
 
 [project.scripts]
 statsmapped-mcp = "statsmapped_mcp.server:main"

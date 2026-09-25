@@ -196,20 +196,39 @@ def main() -> int:
     # neither computes a fresh correlation or reads a current figure.
     x_key = comparison_detail["x"]["series_key"]
     y_key = comparison_detail["y"]["series_key"]
+    # Cold-pass finding, PI session-close 2026-09-23: these two checks were stale
+    # against client.py's own documented 2026-09-20 breaking change -- `comparable`
+    # is a three-way string ("yes"/"no"/"unknown"), never a plain bool, and the
+    # reasons field is plural (`reasons`, a list), never singular `reason`. Verified
+    # live before fixing: GET .../comparisons/check for a real registered pair
+    # returns {"comparable": "yes", ..., "reasons": [...]}. Predates this session's
+    # own edit to the block below -- found by the mandatory wind-down cold pass,
+    # not missed carelessly; this session's commit message had implied the whole
+    # file passed end-to-end when it did not.
     real_pair = client.check_comparability(x_key, y_key)
     check("check_comparability confirms a real registered pair",
-          real_pair.get("comparable") is True
+          real_pair.get("comparable") == "yes"
           and real_pair.get("pair_key") == first_pair_key,
           str(real_pair))
-    check("a confirmed pair still states a reason",
-          bool(real_pair.get("reason")), str(real_pair))
+    check("a confirmed pair still states its reasons",
+          bool(real_pair.get("reasons")), str(real_pair))
 
-    no_pair = client.check_comparability("sale_price", "definitely_not_a_real_stat_key")
-    check("check_comparability refuses an unregistered pair rather than erroring",
-          no_pair.get("comparable") is False and no_pair.get("pair_key") is None,
-          str(no_pair))
-    check("a refusal states WHY, not just false",
-          bool(no_pair.get("reason")), str(no_pair))
+    # TODO.md, "check_comparability()'s live behavior may not match its own test's
+    # contract" (found by PI 2026-09-22, resolved by the developer 2026-09-23): this
+    # used to assert a graceful {comparable: false, reason: ...} for a genuinely
+    # UNRECOGNIZED stat_key -- confirmed live (both here and directly against
+    # /api/v1/comparisons/check) that the API raises 400 instead, and the developer
+    # confirmed that's the deliberate, correct contract, not a regression. Same
+    # try/except shape explain_metric's own unknown-stat_key case already uses just
+    # below -- the graceful comparable:false path is real, but it's for two REAL,
+    # registered stat_keys with no vetted pairing between them, never for a stat_key
+    # that doesn't exist at all.
+    try:
+        client.check_comparability("sale_price", "definitely_not_a_real_stat_key")
+        check("an unrecognized stat_key raises, rather than returning gracefully",
+              False, "expected StatsMappedAPIError, got a normal return")
+    except client.StatsMappedAPIError:
+        pass
 
     explanation = client.explain_metric("sale_price")
     check("explain_metric returns the stat's own label/unit/periodicity",
@@ -298,6 +317,57 @@ def main() -> int:
     except client.StatsMappedAPIError:
         pass
 
+    # --- log_tool_call / _post_tool_call_event (todo:1def7740, MCP usage tracking) --
+    # Fire-and-forget by design, on a daemon thread (REVIEWER caught the first
+    # version claiming "never delay" while still calling httpx synchronously in the
+    # response path -- corrected to an actual background thread). Two genuinely
+    # different things to test here, not one: that the PUBLIC function returns
+    # immediately regardless of how slow or broken the network is (the latency
+    # claim), and that the WORKER function it spawns never lets an exception
+    # escape (the "never break" claim) -- testing only the outer function would
+    # let a worker-side regression hide behind the thread boundary.
+    import time
+
+    start = time.monotonic()
+    client.log_tool_call("list_datasets", "ireland")
+    elapsed = time.monotonic() - start
+    check("log_tool_call returns near-instantly, not after the network call",
+          elapsed < 0.5, f"took {elapsed:.3f}s")
+
+    # Same check against an UNREACHABLE host -- the case most likely to actually
+    # hit the timeout if this were still synchronous. If log_tool_call ever
+    # regresses back to blocking on the httpx call, THIS is the check that catches
+    # it (the reachable-host case above could stay fast by coincidence).
+    original_base_url = client.BASE_URL
+    client.BASE_URL = "https://this-host-does-not-exist.invalid"
+    start = time.monotonic()
+    client.log_tool_call("rank_areas", "ireland")
+    elapsed = time.monotonic() - start
+    client.BASE_URL = original_base_url
+    check("log_tool_call returns near-instantly even against an unreachable host",
+          elapsed < 0.5, f"took {elapsed:.3f}s")
+
+    # The worker function itself, called directly (no thread) so its own
+    # exception-swallowing can be verified synchronously rather than inferred
+    # from the outer function never raising (which a bare `Thread.start()` would
+    # guarantee regardless of what the worker does internally).
+    try:
+        client._post_tool_call_event("list_datasets", "ireland")
+        check("_post_tool_call_event against the real API does not raise", True)
+    except Exception as exc:
+        check("_post_tool_call_event against the real API does not raise", False,
+              f"{type(exc).__name__}: {exc}")
+
+    client.BASE_URL = "https://this-host-does-not-exist.invalid"
+    try:
+        client._post_tool_call_event("rank_areas", "ireland")
+        check("_post_tool_call_event swallows an unreachable-host error", True)
+    except Exception as exc:
+        check("_post_tool_call_event swallows an unreachable-host error", False,
+              f"{type(exc).__name__}: {exc}")
+    finally:
+        client.BASE_URL = original_base_url
+
     if failures:
         print(f"FAILURES ({len(failures)}):")
         for f in failures:
@@ -313,12 +383,12 @@ def main() -> int:
         f"detail tool; history_months converts to real periods; rank_areas sorts "
         f"correctly and returns empty (not wrong) on a level mismatch; "
         f"get_comparison strips raw scatter points and carries attribution; "
-        f"check_comparability confirms a real registered pair and refuses an "
-        f"unregistered one with a stated reason either way (never a bare "
-        f"true/false); explain_metric returns definition/unit/periodicity and "
-        f"never a current figure; a country/area_id mismatch, an unknown "
-        f"pair_key, an unknown stat_key and an invalid country all raise "
-        f"StatsMappedAPIError."
+        f"check_comparability confirms a real registered pair ('yes', never a "
+        f"bare true) with real stated reasons; explain_metric returns "
+        f"definition/unit/periodicity and never a current figure; a "
+        f"country/area_id mismatch, an unknown pair_key, an unrecognized "
+        f"stat_key on either check_comparability or explain_metric, and an "
+        f"invalid country all raise StatsMappedAPIError."
     )
     return 0
 
