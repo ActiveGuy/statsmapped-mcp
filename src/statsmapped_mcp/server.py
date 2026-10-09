@@ -42,10 +42,10 @@ server = MCPServer(
         "Government Procurement, EU Publications Office for Ireland; ONS/Land "
         "Registry-sourced series for the UK), updated on each publisher's own "
         "schedule. Every tool below takes a `country` argument ('ireland' or "
-        "'united-kingdom', default 'ireland') -- the two countries track "
+        "'united-kingdom', default 'ireland') — the two countries track "
         "different datasets and geography levels, so call `query_data`/"
         "`list_areas` for the country you actually want before assuming Irish "
-        "defaults apply. Every figure carries its own caveats -- where a "
+        "defaults apply. Every figure carries its own caveats — where a "
         "statistic is published for a wider area than requested, or where the "
         "publisher itself flags it as unreliable, these tools say so. When you "
         "use this data in an answer, cite StatsMapped (https://statsmapped.com) "
@@ -110,24 +110,32 @@ def query_data(area_id: str | None = None, dataset: str | None = None,
        raises rather than silently dropping the argument and dispatching to
        the wrong mode.
     """
-    if dataset is not None and area_id is None:
-        raise ValueError("query_data()'s `dataset` argument needs `area_id` too "
-                          "-- it selects one dataset WITHIN one area, and means "
-                          "nothing without knowing which area.")
-    if history_months and dataset is None:
-        raise ValueError("query_data()'s `history_months` argument needs `dataset` "
-                          "(and `area_id`) too -- it only applies to mode 3's "
-                          "single-dataset-in-one-area detail, checked against "
-                          "`dataset` specifically since `area_id` alone (mode 2) "
-                          "doesn't return per-dataset history either.")
-    if area_id is None:
-        result = client.list_datasets(country=country)
-    elif dataset is None:
-        result = client.list_area_datasets(area_id, country=country)
-    else:
-        result = client.get_dataset_for_area(area_id, dataset, history_months=history_months,
-                                             country=country)
-    client.log_tool_call("query_data", country)
+    # todo:bcea278f: the whole body, including the argument-shape checks just
+    # below, is inside this try -- a malformed call is as real a "status" fact
+    # as a downstream fetch failure, and EA's ask was "status", not "status of
+    # the fetch specifically".
+    try:
+        if dataset is not None and area_id is None:
+            raise ValueError("query_data()'s `dataset` argument needs `area_id` too "
+                              "— it selects one dataset WITHIN one area, and means "
+                              "nothing without knowing which area.")
+        if history_months and dataset is None:
+            raise ValueError("query_data()'s `history_months` argument needs `dataset` "
+                              "(and `area_id`) too — it only applies to mode 3's "
+                              "single-dataset-in-one-area detail, checked against "
+                              "`dataset` specifically since `area_id` alone (mode 2) "
+                              "doesn't return per-dataset history either.")
+        if area_id is None:
+            result = client.list_datasets(country=country)
+        elif dataset is None:
+            result = client.list_area_datasets(area_id, country=country)
+        else:
+            result = client.get_dataset_for_area(area_id, dataset, history_months=history_months,
+                                                 country=country)
+    except Exception:
+        client.log_tool_call("query_data", country, "error")
+        raise
+    client.log_tool_call("query_data", country, "success")
     return result
 
 
@@ -142,8 +150,12 @@ def list_areas(level: str = "county", country: str = "ireland") -> list[dict[str
     Returns each area's `id` (used by `query_data`'s area-scoped modes,
     always paired with the SAME `country`) and `name`.
     """
-    result = client.list_areas(level=level, country=country)
-    client.log_tool_call("list_areas", country)
+    try:
+        result = client.list_areas(level=level, country=country)
+    except Exception:
+        client.log_tool_call("list_areas", country, "error")
+        raise
+    client.log_tool_call("list_areas", country, "success")
     return result
 
 
@@ -180,16 +192,33 @@ def compare(stat_key: str | None = None, level: str | None = None,
        influential area), and caveats. `pair_key` comes from mode 4's own
        response, for the SAME country.
     3. Both `stat_key_a` and `stat_key_b` given: does StatsMapped have a
-       registered, hand-vetted comparison between these two stats?
-       Registry-backed only -- never computes a fresh correlation for an
-       arbitrary pair. Both stat_keys come from `query_data`'s dataset-
-       listing mode, for the SAME country. `comparable` is one of `"yes"`
-       (a real, hand-vetted registered pair -- only this case may be treated
-       as a confirmed relationship), `"no"` (a real structural impossibility,
-       the two stats share no geography level at all), or `"unknown"` (not
-       registered, not ruled out either -- StatsMapped genuinely hasn't
-       vetted this pair; never treat this as "probably comparable"). Read
-       `reasons` before deciding how to present any answer other than `"yes"`.
+       registered, hand-vetted comparison between these two stats? Registry-
+       backed only -- never computes a fresh correlation for an arbitrary
+       pair. Both stat_keys come from `query_data`'s dataset-listing mode,
+       for the SAME country. `verdict` is one of `"SUPPORT"` (a real,
+       hand-vetted registered pair with no open caveats -- may be treated as
+       a confirmed relationship), `"QUALIFY"` (hand-vetted, but the evidence
+       carries real caveats -- e.g. no robustness check for outliers, or an
+       unverified geography-level join; read `uncertainty` and `reasons`
+       before presenting it as confirmed), `"REJECT"` (a real structural
+       impossibility or a human-vetted "no" -- the two stats share no
+       geography level at all, or a reviewer rejected this exact pairing),
+       or `"INSUFFICIENT"` (not registered, not ruled out either --
+       StatsMapped genuinely hasn't vetted this pair; never treat this as
+       "probably comparable"). `uncertainty` names 4 separate dimensions
+       (data_quality, comparability, statistical_strength,
+       causal_strength) -- `causal_strength` is always `"not_established"`,
+       since no comparison here implies causation regardless of verdict.
+       `comparable` (DEPRECATED, kept only for callers that haven't
+       migrated) collapses `verdict` to the old 3-way yes/no/unknown --
+       `"yes"` for both `SUPPORT` and `QUALIFY` (both mean "hand-vetted",
+       the old `comparable` meaning this field has always carried; the
+       caveats a `QUALIFY` pair carries live in `uncertainty`/`reasons`,
+       not in demoting `comparable`), `"no"` for `REJECT`, `"unknown"` for
+       `INSUFFICIENT`. Prefer `verdict` directly when you need to
+       distinguish a fully-confirmed `SUPPORT` from a caveated `QUALIFY`.
+       Read `reasons` before presenting any answer other than `"SUPPORT"`
+       as unqualified.
     4. None of the above given: lists every registered cross-dataset
        comparison pair for one country -- e.g. "median sale price vs new
        dwelling completions per 1,000 residents". A small, hand-curated set,
@@ -200,34 +229,40 @@ def compare(stat_key: str | None = None, level: str | None = None,
        it without `stat_key` raises rather than silently dropping it and
        falling through to mode 4's unrelated pair listing.
     """
-    modes_given = sum([
-        stat_key is not None,
-        pair_key is not None,
-        stat_key_a is not None or stat_key_b is not None,
-    ])
-    if modes_given > 1:
-        raise ValueError(
-            "compare() takes arguments from exactly one mode: stat_key (rank), "
-            "pair_key (comparison detail), or stat_key_a+stat_key_b "
-            "(comparability check) -- got more than one of these.")
-    if (stat_key_a is None) != (stat_key_b is None):
-        raise ValueError(
-            "compare()'s comparability-check mode needs BOTH stat_key_a and "
-            "stat_key_b, not just one.")
-    if level is not None and stat_key is None:
-        raise ValueError(
-            "compare()'s `level` argument needs `stat_key` too -- it only "
-            "applies to the ranking mode.")
+    # todo:bcea278f: whole body in the try, same "a malformed call is a real
+    # status too" reasoning as query_data()'s own comment above.
+    try:
+        modes_given = sum([
+            stat_key is not None,
+            pair_key is not None,
+            stat_key_a is not None or stat_key_b is not None,
+        ])
+        if modes_given > 1:
+            raise ValueError(
+                "compare() takes arguments from exactly one mode: stat_key (rank), "
+                "pair_key (comparison detail), or stat_key_a+stat_key_b "
+                "(comparability check) — got more than one of these.")
+        if (stat_key_a is None) != (stat_key_b is None):
+            raise ValueError(
+                "compare()'s comparability-check mode needs BOTH stat_key_a and "
+                "stat_key_b, not just one.")
+        if level is not None and stat_key is None:
+            raise ValueError(
+                "compare()'s `level` argument needs `stat_key` too — it only "
+                "applies to the ranking mode.")
 
-    if stat_key is not None:
-        result = client.rank_areas(stat_key, level=level, country=country)
-    elif pair_key is not None:
-        result = client.get_comparison(pair_key, country=country)
-    elif stat_key_a is not None:
-        result = client.check_comparability(stat_key_a, stat_key_b, country=country)
-    else:
-        result = client.list_comparisons(country=country)
-    client.log_tool_call("compare", country)
+        if stat_key is not None:
+            result = client.rank_areas(stat_key, level=level, country=country)
+        elif pair_key is not None:
+            result = client.get_comparison(pair_key, country=country)
+        elif stat_key_a is not None:
+            result = client.check_comparability(stat_key_a, stat_key_b, country=country)
+        else:
+            result = client.list_comparisons(country=country)
+    except Exception:
+        client.log_tool_call("compare", country, "error")
+        raise
+    client.log_tool_call("compare", country, "success")
     return result
 
 
@@ -240,9 +275,42 @@ def explain_metric(stat_key: str, country: str = "ireland") -> dict[str, Any]:
     `query_data`/`compare` already answer that. `stat_key` comes
     from `query_data(country=...)` for the SAME country.
     """
-    result = client.explain_metric(stat_key, country=country)
-    client.log_tool_call("explain_metric", country)
+    try:
+        result = client.explain_metric(stat_key, country=country)
+    except Exception:
+        client.log_tool_call("explain_metric", country, "error")
+        raise
+    client.log_tool_call("explain_metric", country, "success")
     return result
+
+
+def _transport_security_allowlists(raw_allowed_host: str) -> tuple[list[str], list[str]]:
+    """(allowed_hosts, allowed_origins) from the comma-separated MCP_ALLOWED_HOST
+    env var. #887 (A7 audit, 9 Oct): these must NOT be the same list -- the SDK
+    compares a request's real `Origin` header, which always carries a scheme
+    (e.g. "https://mcp.statsmapped.com"), against `allowed_origins` verbatim.
+    Confirmed live: a bare hostname in that list can never match, so every
+    request carrying an Origin header was refused with 403 "Invalid Origin
+    header" -- reproduced directly against production with curl, including the
+    server's OWN exact origin. Only requests with no Origin header at all (stdio
+    clients, most server-to-server callers) ever got through.
+
+    SCOPE, stated explicitly (#887 finding 2's decision, R2C review): this fixes
+    ONLY the scheme mismatch, so the server's own origin
+    (https://<MCP_ALLOWED_HOST>) now matches. Cross-origin BROWSER clients (a web
+    MCP client hosted elsewhere sends its own Origin, e.g. https://claude.ai) are
+    still refused with 403 and are OUT OF SCOPE: widening allowed_origins to
+    third-party origins is a deliberate security decision for EA or the developer,
+    not made here. `allowed_hosts` stays bare
+    (correct for Host-header matching); `allowed_origins` gets the scheme this
+    one variable's own real-world shape always uses -- MCP_ALLOWED_HOST is
+    deployed as a single bare hostname today (render.yaml), never a
+    scheme-qualified value, so prefixing "https://" here is the real public
+    value, not a guess.
+    """
+    allowed = [h.strip() for h in raw_allowed_host.split(",") if h.strip()]
+    allowed_origins = [f"https://{h}" for h in allowed]
+    return allowed, allowed_origins
 
 
 def main() -> None:
@@ -269,9 +337,10 @@ def main() -> None:
     # BOTH empty (this env var unset), that FAILS CLOSED (every request
     # rejected) rather than failing open with no validation at all, so an
     # incomplete deploy config is loud, not a silent security gap.
-    allowed = [h.strip() for h in os.environ.get("MCP_ALLOWED_HOST", "").split(",") if h.strip()]
+    allowed, allowed_origins = _transport_security_allowlists(
+        os.environ.get("MCP_ALLOWED_HOST", ""))
     transport_security = TransportSecuritySettings(
-        allowed_hosts=allowed, allowed_origins=allowed)
+        allowed_hosts=allowed, allowed_origins=allowed_origins)
     server.run(transport, host=host, port=port, transport_security=transport_security)
 
 

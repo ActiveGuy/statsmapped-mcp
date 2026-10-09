@@ -196,22 +196,46 @@ def main() -> int:
     # neither computes a fresh correlation or reads a current figure.
     x_key = comparison_detail["x"]["series_key"]
     y_key = comparison_detail["y"]["series_key"]
-    # Cold-pass finding, PI session-close 2026-09-23: these two checks were stale
-    # against client.py's own documented 2026-09-20 breaking change -- `comparable`
-    # is a three-way string ("yes"/"no"/"unknown"), never a plain bool, and the
-    # reasons field is plural (`reasons`, a list), never singular `reason`. Verified
-    # live before fixing: GET .../comparisons/check for a real registered pair
-    # returns {"comparable": "yes", ..., "reasons": [...]}. Predates this session's
-    # own edit to the block below -- found by the mandatory wind-down cold pass,
-    # not missed carelessly; this session's commit message had implied the whole
-    # file passed end-to-end when it did not.
+    # Campaign E1 (wl:85fe273dcd5b/wl:bb14f319034a), 8 Oct: SECOND breaking change to
+    # this contract, same shape as the 2026-09-20 one the comment below used to
+    # describe. `comparable` is now a DEPRECATED field DERIVED from a new `verdict`
+    # (SUPPORT/QUALIFY/REJECT/INSUFFICIENT) -- {"SUPPORT": "yes", "QUALIFY": "yes",
+    # "REJECT": "no"}.get(verdict, "unknown"), schemas.py's own ComparabilityCheck
+    # comment has the full history. QUALIFY maps to "yes", not "unknown" (DI's real
+    # regression catch before this merged: story_map.py's classify_similar() treats
+    # ONLY comparable=="yes" as a similar edge, and QUALIFY still means "hand-vetted,
+    # comparable, with caveats" -- the old `comparable` meaning must not silently
+    # change just because `verdict` gained a finer-grained vocabulary). Every
+    # registered pair currently caps at QUALIFY, never SUPPORT -- `small_base_share`
+    # (one of evaluate()'s facts) has no computable source yet across comparisons.py's
+    # ~15 hand-curated pairs (flagged to DI/EA, a real open question, not a bug here)
+    # -- but `comparable` still reads "yes" regardless, same as a confirmed SUPPORT
+    # pair always did. `verdict`/`reasons`/`uncertainty` carry the actual nuance.
+    # NOT yet verified against production directly (this change hasn't deployed
+    # there) -- verified instead against staging via the real route handler/engine
+    # together (tests/test_comparability_check.py, same repo, 89 checks), which this
+    # fix mirrors exactly. Re-check this assertion against the real live response
+    # once this change has actually shipped.
     real_pair = client.check_comparability(x_key, y_key)
-    check("check_comparability confirms a real registered pair",
-          real_pair.get("comparable") == "yes"
+    check("check_comparability confirms a real registered pair reaches QUALIFY "
+          "(not yet SUPPORT -- small_base_share has no source across registered "
+          "pairs today)",
+          real_pair.get("verdict") == "QUALIFY"
           and real_pair.get("pair_key") == first_pair_key,
           str(real_pair))
+    check("the deprecated comparable field still reads 'yes' for a hand-vetted "
+          "QUALIFY pair, same as the old 3-way always did -- a caller still "
+          "reading only `comparable` must not be told a confirmed, registered "
+          "pair has become merely 'unknown'",
+          real_pair.get("comparable") == "yes", str(real_pair))
     check("a confirmed pair still states its reasons",
           bool(real_pair.get("reasons")), str(real_pair))
+    check("uncertainty carries all 4 dimensions, causal_strength always not_established",
+          set(real_pair.get("uncertainty") or {}) >=
+          {"data_quality", "comparability", "statistical_strength", "causal_strength"}
+          and (real_pair.get("uncertainty") or {}).get("causal_strength")
+              == "not_established",
+          str(real_pair.get("uncertainty")))
 
     # TODO.md, "check_comparability()'s live behavior may not match its own test's
     # contract" (found by PI 2026-09-22, resolved by the developer 2026-09-23): this
@@ -328,8 +352,14 @@ def main() -> int:
     # let a worker-side regression hide behind the thread boundary.
     import time
 
+    # "query_data"/"compare" -- the real, currently-registered tool names
+    # (wl:b7bd15daaabf's 9->4 consolidation; this block used to pass the old
+    # pre-consolidation names "list_datasets"/"rank_areas", which MCP_TOOL_NAMES
+    # (api.py) no longer recognises -- found live, 2026-10-03, while adding
+    # `status`: those calls were silently landing with no tool_name in `meta`
+    # at all, api.py's own closed-vocabulary check for exactly this).
     start = time.monotonic()
-    client.log_tool_call("list_datasets", "ireland")
+    client.log_tool_call("query_data", "ireland", "success")
     elapsed = time.monotonic() - start
     check("log_tool_call returns near-instantly, not after the network call",
           elapsed < 0.5, f"took {elapsed:.3f}s")
@@ -341,7 +371,7 @@ def main() -> int:
     original_base_url = client.BASE_URL
     client.BASE_URL = "https://this-host-does-not-exist.invalid"
     start = time.monotonic()
-    client.log_tool_call("rank_areas", "ireland")
+    client.log_tool_call("compare", "ireland", "error")
     elapsed = time.monotonic() - start
     client.BASE_URL = original_base_url
     check("log_tool_call returns near-instantly even against an unreachable host",
@@ -352,7 +382,7 @@ def main() -> int:
     # from the outer function never raising (which a bare `Thread.start()` would
     # guarantee regardless of what the worker does internally).
     try:
-        client._post_tool_call_event("list_datasets", "ireland")
+        client._post_tool_call_event("query_data", "ireland", "success")
         check("_post_tool_call_event against the real API does not raise", True)
     except Exception as exc:
         check("_post_tool_call_event against the real API does not raise", False,
@@ -360,7 +390,7 @@ def main() -> int:
 
     client.BASE_URL = "https://this-host-does-not-exist.invalid"
     try:
-        client._post_tool_call_event("rank_areas", "ireland")
+        client._post_tool_call_event("compare", "ireland", "error")
         check("_post_tool_call_event swallows an unreachable-host error", True)
     except Exception as exc:
         check("_post_tool_call_event swallows an unreachable-host error", False,

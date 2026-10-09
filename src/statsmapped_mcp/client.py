@@ -52,7 +52,7 @@ USER_AGENT = f"statsmapped-mcp/{_PKG_VERSION} (+https://statsmapped.com)"
 # already flagged large unfiltered responses, and repeating this string per row in
 # list_area_datasets' `available`/`not_comparable`/`national` arrays would add
 # needless bytes for a fact that's true of the whole response, not any one row.
-ATTRIBUTION = "Data from StatsMapped (https://statsmapped.com) -- cite as the source."
+ATTRIBUTION = "Data from StatsMapped (https://statsmapped.com) — cite as the source."
 
 
 class StatsMappedAPIError(RuntimeError):
@@ -186,9 +186,11 @@ def _get_install_id() -> str | None:
     return _install_id_cache
 
 
-def _post_tool_call_event(tool_name: str, country: str) -> None:
+def _post_tool_call_event(tool_name: str, country: str, status: str) -> None:
     try:
-        payload: dict[str, Any] = {"event_type": "mcp_tool_call", "tool_name": tool_name}
+        payload: dict[str, Any] = {
+            "event_type": "mcp_tool_call", "tool_name": tool_name, "tool_status": status,
+        }
         install_id = _get_install_id()
         if install_id:
             payload["install_id"] = install_id
@@ -204,8 +206,16 @@ def _post_tool_call_event(tool_name: str, country: str) -> None:
         pass
 
 
-def log_tool_call(tool_name: str, country: str) -> None:
-    threading.Thread(target=_post_tool_call_event, args=(tool_name, country),
+# todo:bcea278f, EA decision 3 Oct (wl:19cd8eeca4e1/2cab4dd57ab4): "counts, tool
+# name and status only, no request content or IPs" -- tool_name/install_id were
+# already logged (migration 074); `status` was the one piece this EA ask
+# actually added. `status` is "success" or "error", never an exception message
+# or any other caller-supplied text -- same closed-vocabulary discipline every
+# other EventBeacon field already follows server-side (api.py's own
+# tool_status Literal), so this can never become a place to leak a stack trace
+# or request content through the back door.
+def log_tool_call(tool_name: str, country: str, status: str) -> None:
+    threading.Thread(target=_post_tool_call_event, args=(tool_name, country, status),
                      daemon=True).start()
 
 
@@ -352,17 +362,32 @@ def check_comparability(stat_key_a: str, stat_key_b: str,
     stats? Registry-backed only -- this never computes a fresh correlation for an
     arbitrary pair, and says so plainly (`reasons`) whichever way it answers.
 
-    `comparable` is a THREE-way answer (2026-09-20 -- was a plain bool, a real
-    breaking change, not additive): `"yes"` only for an already hand-vetted
-    registered pair; `"no"` only when the two stats share zero geography level at
-    all, a genuine structural impossibility; `"unknown"` otherwise -- not
-    registered, but not structurally ruled out either, the case the old binary
-    `False` used to swallow indistinguishably from a real "no". Never treat a
-    structural match alone as grounds to imply a relationship StatsMapped hasn't
-    actually vetted -- `"unknown"` is not "probably yes", it is "ask a human
-    first". `reasons` (plural, was singular `reason`) always has at least one
-    entry either way. Source: GET /{country}/api/v1/comparisons/check?stat_key_a=
-    ...&stat_key_b=....
+    `verdict` (2026-10-08 -- was the 3-way `comparable` below, a second real
+    breaking change, not additive) is one of `"SUPPORT"` (hand-vetted, no open
+    caveats -- may be treated as confirmed), `"QUALIFY"` (hand-vetted, but real
+    caveats remain -- read `uncertainty`/`reasons` before presenting it as
+    confirmed; every registered pair reaches at most this today, never SUPPORT,
+    since one evidence dimension has no computable source yet across the
+    catalogue), `"REJECT"` (structurally impossible, or a human reviewer
+    rejected this exact pairing), or `"INSUFFICIENT"` (not registered, not ruled
+    out either -- never treat this as "probably fine"). `uncertainty` names 4
+    separate dimensions (data_quality, comparability, statistical_strength,
+    causal_strength); `causal_strength` is always `"not_established"` regardless
+    of verdict -- a comparison here never implies causation.
+
+    `comparable` (DEPRECATED, 2026-09-20's own three-way answer, kept only for
+    callers that haven't migrated to `verdict`): `"yes"` for both `SUPPORT` and
+    `QUALIFY` -- both mean "hand-vetted", the meaning `comparable` has always
+    carried; a QUALIFY pair's caveats live in `uncertainty`/`reasons`, not in
+    demoting `comparable` to "unknown" (a real regression caught before this
+    shipped -- story_map.py's own classify_similar() treats only `comparable
+    == "yes"` as a similar edge, and silently withholding a hand-vetted pair's
+    authored narrative just because `verdict` gained a finer vocabulary would
+    have been user-visible). `"no"` for REJECT; `"unknown"` for INSUFFICIENT.
+    Prefer `verdict` directly when you need to distinguish a fully-confirmed
+    SUPPORT from a caveated QUALIFY. `reasons` (plural) always has at least
+    one entry whichever way this answers. Source: GET /{country}/api/v1/
+    comparisons/check?stat_key_a=...&stat_key_b=....
     """
     return _get(_api_path("/comparisons/check", country),
                params={"stat_key_a": stat_key_a, "stat_key_b": stat_key_b})
