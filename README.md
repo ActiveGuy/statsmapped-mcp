@@ -3,6 +3,8 @@
 An [MCP](https://modelcontextprotocol.io) server exposing [StatsMapped](https://statsmapped.com)'s
 public API as tools for AI agents (Claude Desktop, Cursor, and any other MCP client).
 
+<!-- mcp-name: com.statsmapped/public-data -->
+
 StatsMapped tracks public data for Ireland (by county) and the UK (by local authority) — housing,
 crime, health, the economy and social welfare — from official publishers (CSO, PSRA, Central Bank
 of Ireland, DHLGH, NTPF, the Office of Government Procurement, EU Publications Office for Ireland;

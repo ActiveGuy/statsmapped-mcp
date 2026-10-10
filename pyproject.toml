@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "statsmapped-mcp"
-version = "0.3.1"
+version = "0.3.2"
 description = "MCP server exposing StatsMapped's public data API for Ireland and the UK (housing, crime, health, economy, social welfare, by county/local authority) as tools for AI agents."
 readme = "README.md"
 requires-python = ">=3.10"
