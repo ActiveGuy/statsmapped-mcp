@@ -92,9 +92,19 @@ def _api_path(suffix: str, country: str) -> str:
     return f"/{country}/api/v1{suffix}"
 
 
+def _request_headers() -> dict[str, str]:
+    """#1489: an OPTIONAL free API key. If STATSMAPPED_API_KEY is set it is sent as X-API-Key on API calls so the caller gets its own rate-limit bucket (the server ignores the header
+    unless it has keys configured). The key goes ONLY on the data calls here: never in the usage beacon, never in an error message."""
+    headers = {"User-Agent": USER_AGENT}
+    key = (os.environ.get("STATSMAPPED_API_KEY") or "").strip()
+    if key:
+        headers["X-API-Key"] = key
+    return headers
+
+
 def _get(path: str, params: dict[str, Any] | None = None) -> Any:
     url = f"{BASE_URL}{path}"
-    with httpx.Client(timeout=TIMEOUT_SECONDS, headers={"User-Agent": USER_AGENT}) as client:
+    with httpx.Client(timeout=TIMEOUT_SECONDS, headers=_request_headers()) as client:
         resp = client.get(url, params=params or {})
     if resp.status_code >= 400:
         detail = None
@@ -186,11 +196,53 @@ def _get_install_id() -> str | None:
     return _install_id_cache
 
 
-def _post_tool_call_event(tool_name: str, country: str, status: str) -> None:
+# #1182 / #1371: which install channel this process came from. Set by whoever installs or hosts it (STATSMAPPED_MCP_CHANNEL); a value outside this closed set is not sent,
+# so the beacon never carries free text. Must equal the Literal on api.py's EventBeacon.client (a repo test pins it).
+CHANNELS = ("hosted", "pypi", "skill", "directory", "registry", "other")
+
+
+def _channel() -> str | None:
+    value = (os.environ.get("STATSMAPPED_MCP_CHANNEL") or "").strip().lower()
+    return value if value in CHANNELS else None
+
+
+ANSWER_TYPES = ("answered", "empty", "error", "unsupported")
+# #1627 phase 1: the only argument names a tool call reports, and only as short identifier-shaped values. Everything else (any free-text argument) is never sent.
+DEMAND_PARAM_KEYS = ("stat_key", "council", "scene_id", "purpose", "area_id", "dataset", "level", "pair_key", "stat_key_a", "stat_key_b", "history_months", "include_parents")
+
+
+def answer_type_for(result: Any = None, exc: BaseException | None = None) -> str:
+    """How a call ended, as a closed word: `error` (the call failed), `unsupported` (the call was malformed, a ValueError raised before any request), `empty` (a reply with
+    nothing in it), else `answered`."""
+    if exc is not None:
+        return "unsupported" if isinstance(exc, ValueError) else "error"
+    if result is None or (isinstance(result, (list, dict, str)) and len(result) == 0):
+        return "empty"
+    if isinstance(result, dict) and result.get("status") == "no_records":     # a planning summary for a council with no records at all
+        return "empty"
+    return "answered"
+
+
+def demand_params(**kwargs: Any) -> dict[str, Any]:
+    """The call's arguments that are on the closed list above and are None-free; the server validates them again."""
+    return {k: v for k, v in kwargs.items() if k in DEMAND_PARAM_KEYS and v is not None}
+
+
+def _post_tool_call_event(tool_name: str, country: str, status: str, params: dict | None = None,
+                          answer_type: str | None = None, latency_ms: int | None = None) -> None:
     try:
         payload: dict[str, Any] = {
             "event_type": "mcp_tool_call", "tool_name": tool_name, "tool_status": status,
         }
+        if params:
+            payload["params"] = params
+        if answer_type in ANSWER_TYPES:
+            payload["answer_type"] = answer_type
+        if latency_ms is not None:
+            payload["latency_ms"] = int(latency_ms)
+        channel = _channel()
+        if channel:
+            payload["client"] = channel
         install_id = _get_install_id()
         if install_id:
             payload["install_id"] = install_id
@@ -214,8 +266,9 @@ def _post_tool_call_event(tool_name: str, country: str, status: str) -> None:
 # other EventBeacon field already follows server-side (api.py's own
 # tool_status Literal), so this can never become a place to leak a stack trace
 # or request content through the back door.
-def log_tool_call(tool_name: str, country: str, status: str) -> None:
-    threading.Thread(target=_post_tool_call_event, args=(tool_name, country, status),
+def log_tool_call(tool_name: str, country: str, status: str, params: dict | None = None,
+                  answer_type: str | None = None, latency_ms: int | None = None) -> None:
+    threading.Thread(target=_post_tool_call_event, args=(tool_name, country, status, params, answer_type, latency_ms),
                      daemon=True).start()
 
 
@@ -228,19 +281,28 @@ def list_datasets(country: str = "ireland") -> list[dict[str, Any]]:
     return _get(_api_path("/stats", country))
 
 
-def list_areas(level: str = "county", country: str = "ireland") -> list[dict[str, Any]]:
+def list_areas(level: str = "county", country: str = "ireland",
+               include_parents: bool = False) -> list[dict[str, Any]]:
     """Every geography StatsMapped knows about at one boundary level, for one
     country (default: Ireland's "county" -- the 26 counties; the UK's own
     primary level is "lad", its local authority districts). `with_boundary` is
     never requested: an agent needs the id/name to look datasets up by, not
     GeoJSON geometry. Source: GET /{country}/api/v1/geographies?level={level}.
+
+    #1202: SLIM by default. Each row is `id`, `name` and `level` only (a 26-county
+    reply was 22 KB, mostly each area's parents and boundary notes, which an agent
+    picking an `area_id` does not need). `include_parents=True` adds the old
+    `parents` list (the regions an area sits in) and `name_ga` for the one call that
+    wants them.
     """
     rows = _get(_api_path("/geographies", country), params={"level": level})
-    # Boundary/centroid are always absent already (with_boundary defaults to
-    # false), but stripped explicitly in case that default ever changes --
-    # this tool's whole point is staying small, not "small today".
-    return [{k: v for k, v in row.items() if k not in ("boundary", "centroid")}
-            for row in rows]
+    return slim_areas(rows, include_parents=include_parents)
+
+
+def slim_areas(rows: list[dict[str, Any]], include_parents: bool = False) -> list[dict[str, Any]]:
+    """Pure. The `list_areas` projection: id, name, level; plus parents and name_ga on request. Boundary and centroid never."""
+    keep = ("id", "name", "level") + (("name_ga", "parents") if include_parents else ())
+    return [{k: row[k] for k in keep if k in row} for row in rows]
 
 
 def _project_caveats(caveats: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -265,7 +327,14 @@ def _project_series_entry(entry: dict[str, Any]) -> dict[str, Any]:
         "latest_value": entry.get("latest_value"),
         "year_on_year_pct": entry.get("year_on_year_pct"),
         "caveats": _project_caveats(entry.get("caveats")),
+        # #1372: who published it and under what class of licence, short enough to keep the listing slim; the full licence URL
+        # and attribution wording come with the single-dataset call (and ride here too when the publisher states one).
+        "publisher": entry.get("publisher"),
+        "licence_class": entry.get("licence_class"),
+        "licence_restrictions": entry.get("licence_restrictions") or [],
     }
+    if entry.get("attribution"):
+        projected["attribution"] = entry["attribution"]
     if entry.get("geo_match") and entry["geo_match"] != "exact":
         # geo_match()'s own verdict -- an agent citing this figure for THIS area
         # needs to know it's actually published for a wider region, the same
@@ -275,7 +344,8 @@ def _project_series_entry(entry: dict[str, Any]) -> dict[str, Any]:
     return projected
 
 
-def list_area_datasets(area_id: str, country: str = "ireland") -> dict[str, Any]:
+def list_area_datasets(area_id: str, country: str = "ireland",
+                       stat_key: str | None = None) -> dict[str, Any]:
     """Every dataset available for one area, projected down to what an agent
     needs to decide which ones matter: name, latest figure, year-on-year change,
     and caveat labels/severity only (not full bodies -- see `_project_caveats`).
@@ -292,14 +362,45 @@ def list_area_datasets(area_id: str, country: str = "ireland") -> dict[str, Any]
     not accidentally cite a not-directly-comparable figure as this area's own).
     """
     data = _get(_api_path(f"/geographies/{area_id}/series", country))
+    # #1202: `stat_key` keeps only that stat's series in every bucket (a Dublin listing is 44 KB for 56 stats; one stat is a
+    # few hundred bytes). Applied BEFORE projection; an unknown stat gives empty buckets, not an error.
+    def keep(entries):
+        return [e for e in entries if stat_key is None or e.get("stat_key") == stat_key]
+
     return {
         "attribution": ATTRIBUTION,
         "geography": data.get("geography"),
-        "available": [_project_series_entry(e) for e in data.get("available", [])],
+        "available": [_project_series_entry(e) for e in keep(data.get("available", []))],
+        # #1279: the API returns this bucket as "not_county_comparable"; reading "not_comparable" left it empty for every agent.
+        # Tolerate both shapes.
         "not_comparable": [_project_series_entry(e)
-                           for e in data.get("not_comparable", [])],
-        "national": [_project_series_entry(e) for e in data.get("national", [])],
+                           for e in keep(data.get("not_county_comparable", data.get("not_comparable", [])))],
+        "national": [_project_series_entry(e) for e in keep(data.get("national", []))],
     }
+
+
+def get_scene(scene_id: str = "ireland-builds", purpose: str = "analytical", vintage: str | None = None, country: str = "ireland") -> dict[str, Any]:
+    """The data to DRAW one scene (today: "ireland-builds", the national quarterly permissions, commencements and completions 2018Q1 on): rows, a table twin, alt text, notes, typed absences
+    instead of zeros, the licence line, a `scene_hash` anyone can recompute, a receipt and the canonical URL. The server renders nothing: the agent draws, and must print the hash and the
+    licence line. `purpose` is "analytical" (default) or "promotional"; a promotional use of a source whose licence forbids advertising is refused (403 licence_refused). `vintage` omitted =
+    the current data vintage; an earlier one is 404 unknown_vintage. Ireland only. Source: GET /{country}/api/v1/scenes/{scene_id}."""
+    if country != "ireland":
+        raise ValueError("scenes exist for Ireland only (country='ireland').")
+    params = {"purpose": purpose}
+    if vintage:
+        params["vintage"] = vintage
+    return _get(_api_path(f"/scenes/{scene_id}", country), params=params)
+
+
+def get_planning_summary(council: str, country: str = "ireland") -> dict[str, Any]:
+    """One Irish council's planning applications by year received, with source, licence, the last data date, a receipt, typed absences and plain notes. A council the national
+    feed stopped carrying is `stopped_reporting` and its missing periods are typed absences, never zeros. `council` is a slug such as 'cork-city-council' (area ids come from
+    `list_areas(level="local_authority")`). Ireland only. Source: GET /{country}/api/v1/planning_summary/{council}."""
+    if country != "ireland":
+        raise ValueError("planning summaries exist for Ireland only (country='ireland').")
+    data = _get(_api_path(f"/planning_summary/{council}", country))
+    data.setdefault("attribution_note", ATTRIBUTION)
+    return data
 
 
 def get_dataset_for_area(area_id: str, dataset: str,
@@ -318,10 +419,39 @@ def get_dataset_for_area(area_id: str, dataset: str,
     Source: GET /{country}/api/v1/geographies/{area_id}/datasets/{dataset}.
     """
     params = {"history_months": history_months} if history_months else None
-    result = _get(_api_path(f"/geographies/{area_id}/datasets/{dataset}", country),
-                  params=params)
+    resolved_from = None
+    try:
+        result = _get(_api_path(f"/geographies/{area_id}/datasets/{dataset}", country), params=params)
+    except StatsMappedAPIError as exc:
+        # #1201: an agent that read mode 1's list naturally passes a STAT key here. If this area has exactly one series for that
+        # stat, answer with it (and say so); if several, name them; if none, the original error stands.
+        if exc.status_code != 404:
+            raise
+        keys = series_keys_for_stat(list_area_datasets(area_id, country=country), dataset)
+        if not keys:
+            raise
+        if len(keys) > 1:
+            raise StatsMappedAPIError(
+                f"{dataset!r} is a stat, and this area has {len(keys)} series for it; pass one of these as `dataset`: "
+                f"{', '.join(keys[:8])}", status_code=404) from exc
+        resolved_from = dataset
+        result = _get(_api_path(f"/geographies/{area_id}/datasets/{keys[0]}", country), params=params)
     result["attribution"] = ATTRIBUTION
+    if resolved_from:
+        result["resolved_from_stat_key"] = resolved_from
     return result
+
+
+def series_keys_for_stat(listing: dict[str, Any], stat_key: str) -> list[str]:
+    """Pure. The series keys in a `list_area_datasets` result whose `stat_key` is `stat_key` (available, then national, then
+    not_comparable), without repeats."""
+    seen: list[str] = []
+    for bucket in ("available", "national", "not_comparable"):
+        for e in listing.get(bucket, []):
+            k = e.get("series_key")
+            if e.get("stat_key") == stat_key and k and k not in seen:
+                seen.append(k)
+    return seen
 
 
 def list_comparisons(country: str = "ireland") -> list[dict[str, Any]]:
@@ -459,7 +589,7 @@ def rank_areas(stat_key: str, level: str | None = None,
         if exc.status_code == 404:
             return []
         raise
-    return [
+    rows = [
         {
             "rank": i + 1,
             "geography_id": row.get("geo_id"),
@@ -476,7 +606,27 @@ def rank_areas(stat_key: str, level: str | None = None,
             # to surface at all.
             "rate_per_1000": row.get("rate_per_1000"),
             "sample_size": row.get("sample_size"),
+            # #1328: the counties a homeless-region row contains (only that ranking has it)
+            **({"member_counties": row["member_counties"]} if row.get("member_counties") else {}),
             "caveats": _project_caveats(data.get("caveats")),
         }
         for i, row in enumerate(data.get("rows", []))
     ]
+    # #1204: a ranked answer must be citable from ONE call. The ranking-level provenance (publisher, licence, and for a rate ranking
+    # the denominator's name, period and publisher) rides on the FIRST row only, so a 361-row ranking does not repeat it 361 times.
+    if rows:
+        rows[0]["provenance"] = ranking_provenance(data)
+    return rows
+
+
+def ranking_provenance(data: dict[str, Any]) -> dict[str, Any]:
+    """Pure. The citation facts of one /rankings/{slug} response: publisher, licence, attribution, the period, and (rate rankings)
+    the denominator. Missing facts are omitted, never invented."""
+    out: dict[str, Any] = {}
+    for key in ("publisher", "licence", "attribution", "latest_period", "permalink"):
+        if data.get(key):
+            out[key] = data[key]
+    den = data.get("denominator")
+    if (data.get("rate_ranked") or data.get("rate_shown")) and den:
+        out["denominator"] = {k: den[k] for k in ("label", "period", "publisher") if den.get(k)}
+    return out

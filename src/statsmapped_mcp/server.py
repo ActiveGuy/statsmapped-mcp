@@ -23,6 +23,7 @@ rows rather than solved with per-session rate-limit keying up front.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 from mcp.server.mcpserver import MCPServer
@@ -78,8 +79,14 @@ async def root_redirect(request: Request) -> RedirectResponse:
 @server.tool()
 def query_data(area_id: str | None = None, dataset: str | None = None,
                history_months: int = 0,
-               country: str = "ireland") -> list[dict[str, Any]] | dict[str, Any]:
-    """Three modes, depending on which of `area_id`/`dataset` are given --
+               country: str = "ireland",
+               stat_key: str | None = None,
+               council: str | None = None) -> list[dict[str, Any]] | dict[str, Any]:
+    """Use when you need to find which datasets exist, which exist for one area, or the figures and history
+    for one area and dataset (or a council planning view). For what a metric means use `explain_metric`;
+    for how areas rank use `compare`.
+
+    Three modes, depending on which of `area_id`/`dataset` are given (plus a planning mode, `council`, described last) --
     consolidates what were three separate tools (list_datasets,
     list_area_datasets, get_dataset_for_area) behind one, since they are all
     really "how do I get data" at different levels of specificity:
@@ -94,7 +101,9 @@ def query_data(area_id: str | None = None, dataset: str | None = None,
        that one area (e.g. "county:kerry" for Ireland, "uk:lad:e09000033" for
        the UK), with its latest figure, year-on-year change, and caveat labels
        only (not full caveat text -- use mode 3 for the full detail on any one
-       dataset that matters). `area_id` comes from `list_areas`; `country`
+       dataset that matters). Pass `stat_key` (from mode 1) to list only that
+       stat's series for the area: a full listing is tens of KB, one stat is a
+       few hundred bytes. `area_id` comes from `list_areas`; `country`
        must match whichever country that call used, or this simply 404s
        ("unknown geography").
     3. Both `area_id` and `dataset` given: full detail for one dataset in one
@@ -102,7 +111,14 @@ def query_data(area_id: str | None = None, dataset: str | None = None,
        `history_months` is set) recent history. `dataset` is a `series_key`
        from mode 2's own response. `history_months` means actual months of
        history (0 = everything) -- e.g. 24 returns 2 years of an annual
-       series, not 24 years. `country` must match `area_id`'s own country.
+       series, not 24 years. `country` must match `area_id`'s own country. A stat key from mode 1 is also
+       accepted as `dataset` when the area has exactly one series for it (the reply says `resolved_from_stat_key`);
+       with several, the error names the series keys to use.
+    4. `council` alone (an Irish council slug, e.g. "cork-city-council"; country "ireland" only; no other argument): that council's planning
+       applications by year received -- count, grant and refusal share of decided applications, median days to a decision -- with source, licence,
+       the last data date, a receipt, plain notes, and typed `absences` instead of zeros. A council the national planning feed has stopped carrying
+       (for example Cork City, last record 2025-11-04) says `status: "stopped_reporting"`: a low recent figure is a feed gap, not fewer applications.
+       Example: query_data(council="cork-city-council").
 
        `dataset` and `history_months` are only meaningful together with
        `area_id` (and, for `history_months`, `dataset` too, since it only
@@ -110,15 +126,27 @@ def query_data(area_id: str | None = None, dataset: str | None = None,
        raises rather than silently dropping the argument and dispatching to
        the wrong mode.
     """
+    _t0 = time.monotonic()
     # todo:bcea278f: the whole body, including the argument-shape checks just
     # below, is inside this try -- a malformed call is as real a "status" fact
     # as a downstream fetch failure, and EA's ask was "status", not "status of
     # the fetch specifically".
     try:
+        if council is not None:
+            if area_id is not None or dataset is not None or stat_key is not None or history_months:
+                raise ValueError("query_data()'s `council` argument is its own mode: give it alone (no area_id, dataset, stat_key or history_months).")
+            if country != "ireland":
+                raise ValueError("query_data()'s `council` mode covers Ireland only (country='ireland').")
+            result = client.get_planning_summary(council, country=country)
+            client.log_tool_call("query_data", country, "success", client.demand_params(council=council), client.answer_type_for(result), int((time.monotonic() - _t0) * 1000))
+            return result
         if dataset is not None and area_id is None:
             raise ValueError("query_data()'s `dataset` argument needs `area_id` too "
                               "— it selects one dataset WITHIN one area, and means "
                               "nothing without knowing which area.")
+        if stat_key is not None and (area_id is None or dataset is not None):
+            raise ValueError("query_data()'s `stat_key` argument filters mode 2's area listing: "
+                             "it needs `area_id` and no `dataset` (a dataset already names one series).")
         if history_months and dataset is None:
             raise ValueError("query_data()'s `history_months` argument needs `dataset` "
                               "(and `area_id`) too — it only applies to mode 3's "
@@ -128,34 +156,43 @@ def query_data(area_id: str | None = None, dataset: str | None = None,
         if area_id is None:
             result = client.list_datasets(country=country)
         elif dataset is None:
-            result = client.list_area_datasets(area_id, country=country)
+            result = (client.list_area_datasets(area_id, country=country, stat_key=stat_key)
+                      if stat_key is not None else client.list_area_datasets(area_id, country=country))
         else:
             result = client.get_dataset_for_area(area_id, dataset, history_months=history_months,
                                                  country=country)
-    except Exception:
-        client.log_tool_call("query_data", country, "error")
+    except Exception as exc:
+        client.log_tool_call("query_data", country, "error", client.demand_params(stat_key=stat_key, council=council, area_id=area_id, dataset=dataset, history_months=history_months), client.answer_type_for(exc=exc), int((time.monotonic() - _t0) * 1000))
         raise
-    client.log_tool_call("query_data", country, "success")
+    client.log_tool_call("query_data", country, "success", client.demand_params(stat_key=stat_key, council=council, area_id=area_id, dataset=dataset, history_months=history_months), client.answer_type_for(result), int((time.monotonic() - _t0) * 1000))
     return result
 
 
 @server.tool()
-def list_areas(level: str = "county", country: str = "ireland") -> list[dict[str, Any]]:
-    """List every geography at one boundary level, for one country ('ireland'
+def list_areas(level: str = "county", country: str = "ireland",
+               include_parents: bool = False) -> list[dict[str, Any]]:
+    """Use when you need the ids and names of the areas (counties, local authorities, districts) to pass to
+    `query_data`.
+
+    List every geography at one boundary level, for one country ('ireland'
     or 'united-kingdom'). `level` defaults to "county" (Ireland's 26 counties);
     the UK's own primary level is "lad" (local authority districts), not
     "county". Other levels exist per country (e.g. Ireland's "local_authority",
     "garda_division") -- see a dataset's own `compatible_levels` from
     `query_data` for which levels a given stat is actually published at.
     Returns each area's `id` (used by `query_data`'s area-scoped modes,
-    always paired with the SAME `country`) and `name`.
+    always paired with the SAME `country`), `name` and `level`. Slim by default;
+    `include_parents=True` adds each area's `parents` (the regions it sits in)
+    and Irish-language name.
     """
+    _t0 = time.monotonic()
     try:
-        result = client.list_areas(level=level, country=country)
-    except Exception:
-        client.log_tool_call("list_areas", country, "error")
+        result = (client.list_areas(level=level, country=country, include_parents=True)
+                  if include_parents else client.list_areas(level=level, country=country))
+    except Exception as exc:
+        client.log_tool_call("list_areas", country, "error", client.demand_params(level=level), client.answer_type_for(exc=exc), int((time.monotonic() - _t0) * 1000))
         raise
-    client.log_tool_call("list_areas", country, "success")
+    client.log_tool_call("list_areas", country, "success", client.demand_params(level=level), client.answer_type_for(result), int((time.monotonic() - _t0) * 1000))
     return result
 
 
@@ -164,7 +201,10 @@ def compare(stat_key: str | None = None, level: str | None = None,
             pair_key: str | None = None,
             stat_key_a: str | None = None, stat_key_b: str | None = None,
             country: str = "ireland") -> list[dict[str, Any]] | dict[str, Any]:
-    """Four modes, depending on which arguments are given -- consolidates what
+    """Use when the question is how areas rank or compare on a stat, or whether two stats can be compared
+    fairly. For one area's own figures use `query_data`.
+
+    Four modes, depending on which arguments are given -- consolidates what
     were four separate tools (rank_areas, list_comparisons, get_comparison,
     check_comparability) behind one, since they are all really "how does this
     stat compare" at different scopes. Exactly one mode's arguments should be
@@ -229,6 +269,7 @@ def compare(stat_key: str | None = None, level: str | None = None,
        it without `stat_key` raises rather than silently dropping it and
        falling through to mode 4's unrelated pair listing.
     """
+    _t0 = time.monotonic()
     # todo:bcea278f: whole body in the try, same "a malformed call is a real
     # status too" reasoning as query_data()'s own comment above.
     try:
@@ -259,28 +300,54 @@ def compare(stat_key: str | None = None, level: str | None = None,
             result = client.check_comparability(stat_key_a, stat_key_b, country=country)
         else:
             result = client.list_comparisons(country=country)
-    except Exception:
-        client.log_tool_call("compare", country, "error")
+    except Exception as exc:
+        client.log_tool_call("compare", country, "error", client.demand_params(stat_key=stat_key, level=level, pair_key=pair_key, stat_key_a=stat_key_a, stat_key_b=stat_key_b), client.answer_type_for(exc=exc), int((time.monotonic() - _t0) * 1000))
         raise
-    client.log_tool_call("compare", country, "success")
+    client.log_tool_call("compare", country, "success", client.demand_params(stat_key=stat_key, level=level, pair_key=pair_key, stat_key_a=stat_key_a, stat_key_b=stat_key_b), client.answer_type_for(result), int((time.monotonic() - _t0) * 1000))
     return result
 
 
 @server.tool()
 def explain_metric(stat_key: str, country: str = "ireland") -> dict[str, Any]:
-    """Definition, methodology and standing caveats for ONE stat ('ireland' or
+    """Use when the question is what a metric means or how it is measured; for a figure use `query_data`.
+
+    Definition, methodology and standing caveats for ONE stat ('ireland' or
     'united-kingdom') -- never a current figure. Call this when the question is
     about what a metric MEANS or how it's measured ("how is the claimant count
     defined", "is this a mean or a median"), not about a specific area's value --
     `query_data`/`compare` already answer that. `stat_key` comes
     from `query_data(country=...)` for the SAME country.
     """
+    _t0 = time.monotonic()
     try:
         result = client.explain_metric(stat_key, country=country)
-    except Exception:
-        client.log_tool_call("explain_metric", country, "error")
+    except Exception as exc:
+        client.log_tool_call("explain_metric", country, "error", client.demand_params(stat_key=stat_key), client.answer_type_for(exc=exc), int((time.monotonic() - _t0) * 1000))
         raise
-    client.log_tool_call("explain_metric", country, "success")
+    client.log_tool_call("explain_metric", country, "success", client.demand_params(stat_key=stat_key), client.answer_type_for(result), int((time.monotonic() - _t0) * 1000))
+    return result
+
+
+@server.tool()
+def get_scene(scene_id: str = "ireland-builds", purpose: str = "analytical", vintage: str | None = None,
+              country: str = "ireland") -> dict[str, Any]:
+    """The data to DRAW one scene, nothing rendered: use it when asked for a chart, still or short clip of a figure you can cite. Today one scene exists, "ireland-builds" (Ireland's homes
+    granted permission, with a commencement notice and completed, by quarter from 2018Q1). The licence DIFFERS BY STAGE (see `licence.stages`): a stage whose licence is unconfirmed or
+    ShareAlike is withheld (its cells are absences, not zeros) and the licence line names its holder. You get rows, a table twin, alt text, notes, `absences` (a missing figure is a typed
+    absence, never a zero), the licence block, `scene_hash`, a `receipt` and the canonical URL. YOU draw it, and the last frame must match the table. Print the `scene_hash` and the licence
+    `line` in the first, middle and last frame, quote only numbers that are in `rows`, do not loop, and keep the "stages are not a cohort" note. `purpose` is "analytical" (default) or
+    "promotional": a promotional use of a source whose licence forbids advertising is refused (licence_refused). `vintage` (ISO date) omitted = the current data; an earlier vintage is
+    not stored and returns unknown_vintage. Example: get_scene(scene_id="ireland-builds").
+    """
+    _t0 = time.monotonic()
+    try:
+        if purpose not in ("analytical", "promotional"):
+            raise ValueError("get_scene()'s `purpose` must be 'analytical' or 'promotional'.")
+        result = client.get_scene(scene_id, purpose=purpose, vintage=vintage, country=country)
+    except Exception as exc:
+        client.log_tool_call("get_scene", country, "error", client.demand_params(scene_id=scene_id, purpose=purpose), client.answer_type_for(exc=exc), int((time.monotonic() - _t0) * 1000))
+        raise
+    client.log_tool_call("get_scene", country, "success", client.demand_params(scene_id=scene_id, purpose=purpose), client.answer_type_for(result), int((time.monotonic() - _t0) * 1000))
     return result
 
 
