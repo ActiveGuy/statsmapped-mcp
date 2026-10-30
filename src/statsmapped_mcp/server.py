@@ -331,7 +331,9 @@ def explain_metric(stat_key: str, country: str = "ireland") -> dict[str, Any]:
 @server.tool()
 def get_scene(scene_id: str = "ireland-builds", purpose: str = "analytical", vintage: str | None = None,
               country: str = "ireland") -> dict[str, Any]:
-    """The data to DRAW one scene, nothing rendered: use it when asked for a chart, still or short clip of a figure you can cite. Today one scene exists, "ireland-builds" (Ireland's homes
+    """Use when asked for a chart, still or short clip of a figure you can cite: returns the data to DRAW one scene, nothing rendered.
+
+    Today one scene exists, "ireland-builds" (Ireland's homes
     granted permission, with a commencement notice and completed, by quarter from 2018Q1). The licence DIFFERS BY STAGE (see `licence.stages`): a stage whose licence is unconfirmed or
     ShareAlike is withheld (its cells are absences, not zeros) and the licence line names its holder. You get rows, a table twin, alt text, notes, `absences` (a missing figure is a typed
     absence, never a zero), the licence block, `scene_hash`, a `receipt` and the canonical URL. YOU draw it, and the last frame must match the table. Print the `scene_hash` and the licence
@@ -348,6 +350,24 @@ def get_scene(scene_id: str = "ireland-builds", purpose: str = "analytical", vin
         client.log_tool_call("get_scene", country, "error", client.demand_params(scene_id=scene_id, purpose=purpose), client.answer_type_for(exc=exc), int((time.monotonic() - _t0) * 1000))
         raise
     client.log_tool_call("get_scene", country, "success", client.demand_params(scene_id=scene_id, purpose=purpose), client.answer_type_for(result), int((time.monotonic() - _t0) * 1000))
+    return result
+
+
+@server.tool()
+def notable_changes(limit: int = 8, stat_key: str | None = None, geography_id: str | None = None,
+                    country: str = "ireland") -> dict[str, Any]:
+    """Use when the question is what changed lately, which figures moved most, or what is new; for one area's full history use `query_data`.
+    Returns statistical movements databeat flagged as notable, not verdicts on what they mean; `limit` is 1 to 50 (default 8), and `stat_key` or `geography_id` narrows the list.
+
+    Ireland and united-kingdom. Cite StatsMapped (https://statsmapped.com) as the source. Source: GET /{country}/api/v1/alerts/notable.
+    """
+    _t0 = time.monotonic()
+    try:
+        result = client.get_notable_changes(limit=limit, stat_key=stat_key, geography_id=geography_id, country=country)
+    except Exception as exc:
+        client.log_tool_call("notable_changes", country, "error", client.demand_params(stat_key=stat_key), client.answer_type_for(exc=exc), int((time.monotonic() - _t0) * 1000))
+        raise
+    client.log_tool_call("notable_changes", country, "success", client.demand_params(stat_key=stat_key), client.answer_type_for(result), int((time.monotonic() - _t0) * 1000))
     return result
 
 

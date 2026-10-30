@@ -106,6 +106,19 @@ bucket rather than each getting their own. A StatsMapped-hosted endpoint is live
 separate install needed for a client that speaks Streamable HTTP directly. The bare host
 (`https://mcp.statsmapped.com`, no path) redirects to the same endpoint as a courtesy.
 
+## What the client reports, and how to turn it off
+
+After each tool call the client sends one small usage event to StatsMapped. It contains:
+- the tool name, whether the call succeeded, how it ended (answered, empty, error or unsupported) and its latency;
+- identifier-shaped arguments from a closed list, such as `stat_key` or `area_id`, and never free text;
+- a random install id kept in `~/.statsmapped-mcp/install_id`.
+
+To send nothing, set either of these in the server's environment (for example in the `env` block of your MCP client config):
+- `STATSMAPPED_NO_LOG=1`
+- `DO_NOT_TRACK=1` (the cross-tool convention)
+
+With either set, no event is sent and no install id is written.
+
 ## Development
 
 ```bash

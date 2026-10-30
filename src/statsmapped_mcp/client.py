@@ -228,8 +228,20 @@ def demand_params(**kwargs: Any) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if k in DEMAND_PARAM_KEYS and v is not None}
 
 
+# #1677: the server's X-No-Log header is unreachable for an MCP caller (this process sends the beacon, not the agent), so the opt-out lives here. Either variable set
+# to a true value sends nothing at all, and no install id is written to disk. DO_NOT_TRACK is the cross-tool convention (consoledonottrack.com).
+_OPT_OUT_VARS = ("STATSMAPPED_NO_LOG", "DO_NOT_TRACK")
+_TRUE_WORDS = ("1", "true", "yes", "on")
+
+
+def _opted_out() -> bool:
+    return any((os.environ.get(v) or "").strip().lower() in _TRUE_WORDS for v in _OPT_OUT_VARS)
+
+
 def _post_tool_call_event(tool_name: str, country: str, status: str, params: dict | None = None,
                           answer_type: str | None = None, latency_ms: int | None = None) -> None:
+    if _opted_out():
+        return
     try:
         payload: dict[str, Any] = {
             "event_type": "mcp_tool_call", "tool_name": tool_name, "tool_status": status,
@@ -268,6 +280,8 @@ def _post_tool_call_event(tool_name: str, country: str, status: str, params: dic
 # or request content through the back door.
 def log_tool_call(tool_name: str, country: str, status: str, params: dict | None = None,
                   answer_type: str | None = None, latency_ms: int | None = None) -> None:
+    if _opted_out():
+        return
     threading.Thread(target=_post_tool_call_event, args=(tool_name, country, status, params, answer_type, latency_ms),
                      daemon=True).start()
 
@@ -392,6 +406,22 @@ def get_scene(scene_id: str = "ireland-builds", purpose: str = "analytical", vin
     return _get(_api_path(f"/scenes/{scene_id}", country), params=params)
 
 
+def get_notable_changes(limit: int = 8, stat_key: str | None = None, geography_id: str | None = None,
+                        country: str = "ireland") -> dict[str, Any]:
+    """Use when the question is what changed lately, which figures moved most, or what is new. These are statistical movements databeat flagged
+    as notable, not verdicts on what they mean. `limit` is 1 to 50 (default 8); `stat_key` and
+    `geography_id` narrow the list. Ireland and united-kingdom. Source: GET /{country}/api/v1/alerts/notable."""
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
+        raise ValueError(f"notable_changes()'s `limit` must be an integer from 1 to 50, got {limit!r}.")
+    params: dict[str, Any] = {"limit": limit}
+    if stat_key is not None:
+        params["stat_key"] = stat_key
+    if geography_id is not None:
+        params["geography_id"] = geography_id
+    alerts = _get(_api_path("/alerts/notable", country), params=params)
+    return {"alerts": alerts, "count": len(alerts), "attribution_note": ATTRIBUTION}
+
+
 def get_planning_summary(council: str, country: str = "ireland") -> dict[str, Any]:
     """One Irish council's planning applications by year received, with source, licence, the last data date, a receipt, typed absences and plain notes. A council the national
     feed stopped carrying is `stopped_reporting` and its missing periods are typed absences, never zeros. `council` is a slug such as 'cork-city-council' (area ids come from
@@ -496,9 +526,10 @@ def check_comparability(stat_key_a: str, stat_key_b: str,
     breaking change, not additive) is one of `"SUPPORT"` (hand-vetted, no open
     caveats -- may be treated as confirmed), `"QUALIFY"` (hand-vetted, but real
     caveats remain -- read `uncertainty`/`reasons` before presenting it as
-    confirmed; every registered pair reaches at most this today, never SUPPORT,
-    since one evidence dimension has no computable source yet across the
-    catalogue), `"REJECT"` (structurally impossible, or a human reviewer
+    confirmed; SUPPORT also needs a computed small-base share, which the API
+    computes only when a site switch is on (off by default): while it is off every
+    registered pair reaches at most QUALIFY, and a pair resting on a modelled
+    estimate stays at QUALIFY either way), `"REJECT"` (structurally impossible, or a human reviewer
     rejected this exact pairing), or `"INSUFFICIENT"` (not registered, not ruled
     out either -- never treat this as "probably fine"). `uncertainty` names 4
     separate dimensions (data_quality, comparability, statistical_strength,

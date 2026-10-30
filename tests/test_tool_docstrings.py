@@ -25,7 +25,7 @@ FIRST_SENTENCE_MAX = 330        # the whole opening sentence pair an agent reads
 # opens with "Use when" (delete it from this set then), so the list can only shrink, and the follow-up
 # that rewords the tool removes the entry in the same change. Landing order of the two PRs is then free
 # (R1's hazard on #1841), and the landing bot re-arms auto-merge whatever a hold says.
-PENDING_REWORD = {"get_scene"}
+PENDING_REWORD: set[str] = set()
 
 
 def check(label: str, condition: bool, detail: str = "") -> None:
