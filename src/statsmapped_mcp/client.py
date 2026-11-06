@@ -22,6 +22,7 @@ can do so without a code change.
 from __future__ import annotations
 
 import os
+import re
 import threading
 import uuid
 from importlib.metadata import PackageNotFoundError, version
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from mcp.server.mcpserver.exceptions import ToolError
 
 BASE_URL = os.environ.get("STATSMAPPED_MCP_BASE_URL", "https://statsmapped.com")
 TIMEOUT_SECONDS = 20.0
@@ -55,7 +57,22 @@ USER_AGENT = f"statsmapped-mcp/{_PKG_VERSION} (+https://statsmapped.com)"
 ATTRIBUTION = "Data from StatsMapped (https://statsmapped.com) — cite as the source."
 
 
-class StatsMappedAPIError(RuntimeError):
+def _cite(result: dict[str, Any]) -> dict[str, Any]:
+    """#2638: StatsMapped's own citation note goes in `attribution_note`. `attribution` keeps the PUBLISHER's wording when the API sends one
+    (#1372's licence fields), and falls back to the StatsMapped note only when it does not, so a single-figure answer never loses the publisher's attribution."""
+    result["attribution_note"] = ATTRIBUTION
+    if not result.get("attribution"):
+        result["attribution"] = ATTRIBUTION
+    return result
+
+
+class ArgumentError(ToolError, ValueError):
+    """#2665: a tool was called with arguments it cannot use. A `ToolError`, so the SDK passes this text to the
+    agent instead of its generic `Error executing tool <name>` (any other exception counts as a crash, and its
+    message is dropped); still a `ValueError` for every caller that already catches one."""
+
+
+class StatsMappedAPIError(ToolError, RuntimeError):
     """Raised on any non-2xx response, with the API's own error detail if it sent
     one -- so an agent calling a tool gets a legible reason (e.g. "unknown
     geography 'county:atlantis'") rather than a bare stack trace or HTTP status.
@@ -66,6 +83,8 @@ class StatsMappedAPIError(RuntimeError):
     first real consumer -- can check `exc.status_code == 404` rather than
     parsing this exception's own message text, which is meant for a human to
     read, not a program to pattern-match.
+
+    A `ToolError` too (#2665), or the SDK would drop that legible reason as a crash.
     """
 
     def __init__(self, message: str, status_code: int | None = None) -> None:
@@ -393,14 +412,27 @@ def list_area_datasets(area_id: str, country: str = "ireland",
     }
 
 
-def get_scene(scene_id: str = "ireland-builds", purpose: str = "analytical", vintage: str | None = None, country: str = "ireland") -> dict[str, Any]:
-    """The data to DRAW one scene (today: "ireland-builds", the national quarterly permissions, commencements and completions 2018Q1 on): rows, a table twin, alt text, notes, typed absences
+_COUNTY_ID = re.compile(r"^county:[a-z0-9][a-z0-9\-]*$")
+
+
+def get_scene(scene_id: str = "ireland-builds", purpose: str = "analytical", vintage: str | None = None, country: str = "ireland",
+              county: str | None = None, terms: str = "real") -> dict[str, Any]:
+    """The data to DRAW one scene ("ireland-builds", the national quarterly permissions, commencements and completions 2018Q1 on; or "county-in-motion", one county against the county median, one row per year, with `county` like county:cork and `terms` real or nominal): rows, a table twin, alt text, notes, typed absences
     instead of zeros, the licence line, a `scene_hash` anyone can recompute, a receipt and the canonical URL. The server renders nothing: the agent draws, and must print the hash and the
     licence line. `purpose` is "analytical" (default) or "promotional"; a promotional use of a source whose licence forbids advertising is refused (403 licence_refused). `vintage` omitted =
     the current data vintage; an earlier one is 404 unknown_vintage. Ireland only. Source: GET /{country}/api/v1/scenes/{scene_id}."""
     if country != "ireland":
-        raise ValueError("scenes exist for Ireland only (country='ireland').")
+        raise ArgumentError("scenes exist for Ireland only (country='ireland').")
     params = {"purpose": purpose}
+    if scene_id == "county-in-motion":
+        # #3292 item 8: an Ireland-only literal route with no /{country}/ twin, so the path is bare. `vintage` is not a parameter of this scene.
+        if terms not in ("real", "nominal"):
+            raise ArgumentError("get_scene()'s `terms` must be 'real' or 'nominal'.")
+        county = county or "county:dublin"
+        if not _COUNTY_ID.match(county):
+            raise ArgumentError("get_scene()'s `county` must look like county:cork (county: then a lower-case slug).")
+        params.update({"county": county, "terms": terms})
+        return _get("/api/v1/scenes/county-in-motion", params=params)
     if vintage:
         params["vintage"] = vintage
     return _get(_api_path(f"/scenes/{scene_id}", country), params=params)
@@ -412,7 +444,7 @@ def get_notable_changes(limit: int = 8, stat_key: str | None = None, geography_i
     as notable, not verdicts on what they mean. `limit` is 1 to 50 (default 8); `stat_key` and
     `geography_id` narrow the list. Ireland and united-kingdom. Source: GET /{country}/api/v1/alerts/notable."""
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 50:
-        raise ValueError(f"notable_changes()'s `limit` must be an integer from 1 to 50, got {limit!r}.")
+        raise ArgumentError(f"notable_changes()'s `limit` must be an integer from 1 to 50, got {limit!r}.")
     params: dict[str, Any] = {"limit": limit}
     if stat_key is not None:
         params["stat_key"] = stat_key
@@ -427,7 +459,7 @@ def get_planning_summary(council: str, country: str = "ireland") -> dict[str, An
     feed stopped carrying is `stopped_reporting` and its missing periods are typed absences, never zeros. `council` is a slug such as 'cork-city-council' (area ids come from
     `list_areas(level="local_authority")`). Ireland only. Source: GET /{country}/api/v1/planning_summary/{council}."""
     if country != "ireland":
-        raise ValueError("planning summaries exist for Ireland only (country='ireland').")
+        raise ArgumentError("planning summaries exist for Ireland only (country='ireland').")
     data = _get(_api_path(f"/planning_summary/{council}", country))
     data.setdefault("attribution_note", ATTRIBUTION)
     return data
@@ -466,7 +498,7 @@ def get_dataset_for_area(area_id: str, dataset: str,
                 f"{', '.join(keys[:8])}", status_code=404) from exc
         resolved_from = dataset
         result = _get(_api_path(f"/geographies/{area_id}/datasets/{keys[0]}", country), params=params)
-    result["attribution"] = ATTRIBUTION
+    _cite(result)
     if resolved_from:
         result["resolved_from_stat_key"] = resolved_from
     return result
@@ -512,7 +544,7 @@ def get_comparison(pair_key: str, country: str = "ireland") -> dict[str, Any]:
     """
     result = _get(_api_path(f"/comparisons/{pair_key}", country))
     result.pop("points", None)
-    result["attribution"] = ATTRIBUTION
+    _cite(result)
     return result
 
 
@@ -563,8 +595,15 @@ def explain_metric(stat_key: str, country: str = "ireland") -> dict[str, Any]:
     value. `stat_key` comes from `list_datasets(country=...)`. Source: GET
     /{country}/api/v1/stats/{stat_key}/explain.
     """
-    result = _get(_api_path(f"/stats/{stat_key}/explain", country))
-    result["attribution"] = ATTRIBUTION
+    try:
+        result = _get(_api_path(f"/stats/{stat_key}/explain", country))
+    except StatsMappedAPIError as exc:
+        if exc.status_code != 404:
+            raise
+        # #2406: the API's 404 points at a REST path an MCP agent cannot call; say what to do with the tools it does have.
+        raise ArgumentError(f"{stat_key!r} is not a stat published for {country}. Call query_data with no area_id or dataset (country={country!r}) "
+                            f"to list the valid stat_keys.") from exc
+    _cite(result)
     return result
 
 

@@ -29,6 +29,15 @@ def check(label: str, condition: bool, detail: str = "") -> None:
         failures.append(f"{label}{': ' + detail if detail else ''}")
 
 
+def check_cites(label: str, answer: dict, path: str, params: dict | None = None) -> None:
+    """#2638: the tool's `attribution` is exactly the publisher's wording the API sent (the StatsMapped note only when it sent none), and
+    `attribution_note` is the StatsMapped note. Compared against a raw GET of the same route, so a client that overwrote the publisher's
+    wording with the note fails here; `bool(attribution)` alone passed either way, since the fallback always fills it."""
+    expected = client._get(path, params=params).get("attribution") or client.ATTRIBUTION
+    check(label, answer.get("attribution_note") == client.ATTRIBUTION and answer.get("attribution") == expected,
+          f"attribution={answer.get('attribution')!r} attribution_note={answer.get('attribution_note')!r} expected={expected!r}")
+
+
 def main() -> int:
     # --- list_datasets ------------------------------------------------------
     datasets = client.list_datasets()
@@ -80,9 +89,8 @@ def main() -> int:
         check("get_dataset_for_area carries full caveat bodies (unprojected)",
               any(c.get("body") for c in detail.get("caveats", [])),
               str(detail.get("caveats"))[:300])
-        check("get_dataset_for_area carries a top-level attribution field",
-              detail.get("attribution") == client.ATTRIBUTION,
-              str(detail.get("attribution")))
+        check_cites("get_dataset_for_area keeps the publisher's attribution, with the StatsMapped note beside it", detail,
+                    client._api_path(f"/geographies/county:kerry/datasets/{series_key_for_detail}", "ireland"))
 
         detail_2yr = client.get_dataset_for_area(
             "county:kerry", series_key_for_detail, history_months=24)
@@ -164,9 +172,8 @@ def main() -> int:
           str(list(comparison_detail)))
     check("get_comparison strips the raw per-area scatter points",
           "points" not in comparison_detail, str(list(comparison_detail)))
-    check("get_comparison carries a top-level attribution field",
-          comparison_detail.get("attribution") == client.ATTRIBUTION,
-          str(comparison_detail.get("attribution")))
+    check_cites("get_comparison keeps the publisher's attribution, with the StatsMapped note beside it", comparison_detail,
+                client._api_path(f"/comparisons/{first_pair_key}", "ireland"))
     check("get_comparison's x/y axes each carry a label",
           comparison_detail["x"].get("label") and comparison_detail["y"].get("label"),
           str((comparison_detail.get("x"), comparison_detail.get("y"))))
@@ -262,9 +269,8 @@ def main() -> int:
     check("explain_metric never returns a current figure",
           "latest_value" not in explanation and "value" not in explanation,
           str(list(explanation)))
-    check("explain_metric carries a top-level attribution field",
-          explanation.get("attribution") == client.ATTRIBUTION,
-          str(explanation.get("attribution")))
+    check_cites("explain_metric keeps the publisher's attribution, with the StatsMapped note beside it", explanation,
+                client._api_path("/stats/sale_price/explain", "ireland"))
 
     try:
         client.explain_metric("definitely_not_a_real_stat_key")

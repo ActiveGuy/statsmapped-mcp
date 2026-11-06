@@ -134,21 +134,21 @@ def query_data(area_id: str | None = None, dataset: str | None = None,
     try:
         if council is not None:
             if area_id is not None or dataset is not None or stat_key is not None or history_months:
-                raise ValueError("query_data()'s `council` argument is its own mode: give it alone (no area_id, dataset, stat_key or history_months).")
+                raise client.ArgumentError("query_data()'s `council` argument is its own mode: give it alone (no area_id, dataset, stat_key or history_months).")
             if country != "ireland":
-                raise ValueError("query_data()'s `council` mode covers Ireland only (country='ireland').")
+                raise client.ArgumentError("query_data()'s `council` mode covers Ireland only (country='ireland').")
             result = client.get_planning_summary(council, country=country)
             client.log_tool_call("query_data", country, "success", client.demand_params(council=council), client.answer_type_for(result), int((time.monotonic() - _t0) * 1000))
             return result
         if dataset is not None and area_id is None:
-            raise ValueError("query_data()'s `dataset` argument needs `area_id` too "
+            raise client.ArgumentError("query_data()'s `dataset` argument needs `area_id` too "
                               "— it selects one dataset WITHIN one area, and means "
                               "nothing without knowing which area.")
         if stat_key is not None and (area_id is None or dataset is not None):
-            raise ValueError("query_data()'s `stat_key` argument filters mode 2's area listing: "
+            raise client.ArgumentError("query_data()'s `stat_key` argument filters mode 2's area listing: "
                              "it needs `area_id` and no `dataset` (a dataset already names one series).")
         if history_months and dataset is None:
-            raise ValueError("query_data()'s `history_months` argument needs `dataset` "
+            raise client.ArgumentError("query_data()'s `history_months` argument needs `dataset` "
                               "(and `area_id`) too — it only applies to mode 3's "
                               "single-dataset-in-one-area detail, checked against "
                               "`dataset` specifically since `area_id` alone (mode 2) "
@@ -279,16 +279,16 @@ def compare(stat_key: str | None = None, level: str | None = None,
             stat_key_a is not None or stat_key_b is not None,
         ])
         if modes_given > 1:
-            raise ValueError(
+            raise client.ArgumentError(
                 "compare() takes arguments from exactly one mode: stat_key (rank), "
                 "pair_key (comparison detail), or stat_key_a+stat_key_b "
                 "(comparability check) — got more than one of these.")
         if (stat_key_a is None) != (stat_key_b is None):
-            raise ValueError(
+            raise client.ArgumentError(
                 "compare()'s comparability-check mode needs BOTH stat_key_a and "
                 "stat_key_b, not just one.")
         if level is not None and stat_key is None:
-            raise ValueError(
+            raise client.ArgumentError(
                 "compare()'s `level` argument needs `stat_key` too — it only "
                 "applies to the ranking mode.")
 
@@ -330,11 +330,12 @@ def explain_metric(stat_key: str, country: str = "ireland") -> dict[str, Any]:
 
 @server.tool()
 def get_scene(scene_id: str = "ireland-builds", purpose: str = "analytical", vintage: str | None = None,
-              country: str = "ireland") -> dict[str, Any]:
+              country: str = "ireland", county: str | None = None, terms: str = "real") -> dict[str, Any]:
     """Use when asked for a chart, still or short clip of a figure you can cite: returns the data to DRAW one scene, nothing rendered.
 
-    Today one scene exists, "ireland-builds" (Ireland's homes
-    granted permission, with a commencement notice and completed, by quarter from 2018Q1). The licence DIFFERS BY STAGE (see `licence.stages`): a stage whose licence is unconfirmed or
+    Two scenes exist. "ireland-builds" is Ireland's homes
+    granted permission, with a commencement notice and completed, by quarter from 2018Q1. "county-in-motion" is one county against the county median, one row per year: pass `county`
+    (for example county:cork; default county:dublin) and `terms` ("real" default, or "nominal"); `vintage` does not apply to it. For ireland-builds the licence DIFFERS BY STAGE (see `licence.stages`): a stage whose licence is unconfirmed or
     ShareAlike is withheld (its cells are absences, not zeros) and the licence line names its holder. You get rows, a table twin, alt text, notes, `absences` (a missing figure is a typed
     absence, never a zero), the licence block, `scene_hash`, a `receipt` and the canonical URL. YOU draw it, and the last frame must match the table. Print the `scene_hash` and the licence
     `line` in the first, middle and last frame, quote only numbers that are in `rows`, do not loop, and keep the "stages are not a cohort" note. `purpose` is "analytical" (default) or
@@ -344,8 +345,9 @@ def get_scene(scene_id: str = "ireland-builds", purpose: str = "analytical", vin
     _t0 = time.monotonic()
     try:
         if purpose not in ("analytical", "promotional"):
-            raise ValueError("get_scene()'s `purpose` must be 'analytical' or 'promotional'.")
-        result = client.get_scene(scene_id, purpose=purpose, vintage=vintage, country=country)
+            raise client.ArgumentError("get_scene()'s `purpose` must be 'analytical' or 'promotional'.")
+        extra = {} if (county is None and terms == "real") else {"county": county, "terms": terms}   # only when asked, so the common call is unchanged
+        result = client.get_scene(scene_id, purpose=purpose, vintage=vintage, country=country, **extra)
     except Exception as exc:
         client.log_tool_call("get_scene", country, "error", client.demand_params(scene_id=scene_id, purpose=purpose), client.answer_type_for(exc=exc), int((time.monotonic() - _t0) * 1000))
         raise

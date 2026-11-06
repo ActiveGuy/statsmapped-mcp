@@ -46,7 +46,7 @@ equivalent `mcp.json`):
 
 ## Tools
 
-4 tools (consolidated from an original 9 -- `query_data` and `compare` are each one tool with a
+6 tools (consolidated from an original 9 -- `query_data` and `compare` are each one tool with a
 few modes, chosen by which arguments you give, rather than several near-identical single-purpose
 ones). Every tool takes a `country` argument (`"ireland"` or `"united-kingdom"`, default
 `"ireland"`) — Ireland and the UK track different datasets and geography levels, so call
@@ -86,6 +86,24 @@ ones). Every tool takes a `country` argument (`"ireland"` or `"united-kingdom"`,
 - **`explain_metric(stat_key, country="ireland")`** — definition, methodology and standing caveats
   for one stat, never a current figure. Use this when the question is about what a metric means or
   how it's measured, not about one area's value.
+- **`get_scene(scene_id="ireland-builds", purpose="analytical", vintage=None, country="ireland")`**
+  — the data to draw one chart or short clip of a citable figure (rows, a table twin, alt text, the
+  licence block, `scene_hash`), nothing rendered. Two scenes exist: `"ireland-builds"` and `"county-in-motion"` (one county against the county median, one row per year; pass `county="county:cork"` and `terms="real"` or `"nominal"`). A
+  promotional use of a source whose licence forbids advertising is refused.
+- **`notable_changes(limit=8, stat_key=None, geography_id=None, country="ireland")`** — the
+  statistical movements StatsMapped flagged as notable, newest first (`limit` 1 to 50), optionally
+  narrowed to one stat or one area. They are movements, not verdicts on what they mean.
+
+**Citing an answer.** A single-figure answer (`query_data` with both arguments, `compare` with
+`pair_key`, `explain_metric`) carries `attribution`: the publisher's own required wording when the
+publisher states one (for example "Source: Office for National Statistics. Contains public sector
+information licensed under the Open Government Licence v3.0."), otherwise
+StatsMapped's note. StatsMapped's note is always in `attribution_note`. Quote `attribution`
+where you show the figure; `publisher`, `license` and `licence_class` sit beside it (on each axis,
+for a comparison). A list of many datasets (`query_data` with `area_id` alone) has more than one
+publisher, so its top-level `attribution` is StatsMapped's note, and each entry carries its own
+publisher's `attribution` when that publisher states one. `notable_changes` carries only
+`attribution_note`.
 
 ## Why stdio, not a hosted server, by default
 
